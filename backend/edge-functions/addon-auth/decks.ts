@@ -67,7 +67,8 @@ serve(async (req) => {
       )
     }
 
-    // Get purchased decks
+    // Get purchased decks (only completed purchases)
+    // Payment processing happens on web app, addon only checks purchase status
     const { data: purchases, error: purchasesError } = await supabase
       .from('purchases')
       .select(`
@@ -83,6 +84,7 @@ serve(async (req) => {
         )
       `)
       .eq('user_id', user.id)
+      .eq('payment_status', 'completed') // Only show completed purchases
       .order('purchased_at', { ascending: false })
 
     if (purchasesError) {

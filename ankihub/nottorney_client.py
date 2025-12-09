@@ -9,13 +9,18 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, TypedDict, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, TypedDict, Union
 
 import requests
 import structlog
+import time
+from requests.exceptions import ConnectionError, Timeout
 
 from .ankihub_client.models import (
     ANKIHUB_DATETIME_FORMAT_STR,
+    CardReviewData,
+    ChangeNoteSuggestion,
+    DailyCardReviewSummary,
     Deck,
     DeckExtension,
     DeckExtensionUpdateChunk,
@@ -24,7 +29,9 @@ from .ankihub_client.models import (
     DeckUpdates,
     DeckUpdatesChunk,
     Field,
+    NewNoteSuggestion,
     NoteInfo,
+    NoteSuggestion,
     NotesAction,
     UserDeckRelation,
 )
@@ -36,6 +43,10 @@ NOTTORNEY_API_URL = "https://tpsaalbgdfjtzsnwswki.supabase.co/functions/v1/addon
 CONNECTION_TIMEOUT = 10
 STANDARD_READ_TIMEOUT = 30
 LONG_READ_TIMEOUT = 600  # For file downloads
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
 # Incremental sync constants
 DECK_UPDATE_PAGE_SIZE = 2000
@@ -51,8 +62,22 @@ class NottorneyHTTPError(Exception):
     def __init__(self, response: requests.Response):
         self.response = response
         self.status_code = response.status_code
+        self.error_code = None
+        self.message = None
+        
+        # Try to parse detailed error from response
+        try:
+            error_data = response.json()
+            self.error_code = error_data.get("error", "unknown")
+            self.message = error_data.get("message", response.reason)
+        except (ValueError, KeyError):
+            # If JSON parsing fails, use basic error info
+            self.error_code = "unknown"
+            self.message = response.reason
 
     def __str__(self):
+        if self.error_code and self.message:
+            return f"Nottorney API error ({self.error_code}): {self.message}"
         return f"Nottorney API error: {self.status_code} {self.response.reason}"
 
 
@@ -98,7 +123,7 @@ class NottorneyClient:
         stream=False,
         is_long_running=False,
     ) -> requests.Response:
-        """Send a request to the Nottorney API or S3."""
+        """Send a request to the Nottorney API or S3 with automatic retry on transient failures."""
         if api == API.NOTTORNEY:
             url = f"{self.api_url}{url_suffix}" if url_suffix.startswith("/") else f"{self.api_url}/{url_suffix}"
         elif api == API.S3:
@@ -113,19 +138,40 @@ class NottorneyClient:
         timeout = LONG_READ_TIMEOUT if is_long_running else STANDARD_READ_TIMEOUT
         timeout_tuple = (CONNECTION_TIMEOUT, timeout)
 
-        response = requests.request(
-            method=method,
-            url=url,
-            json=json,
-            data=data,
-            files=files,
-            params=params,
-            headers=headers,
-            stream=stream,
-            timeout=timeout_tuple,
-        )
+        # Retry logic for transient network failures
+        last_exception = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    json=json,
+                    data=data,
+                    files=files,
+                    params=params,
+                    headers=headers,
+                    stream=stream,
+                    timeout=timeout_tuple,
+                )
+                return response
+            except (ConnectionError, Timeout) as e:
+                last_exception = e
+                if attempt < MAX_RETRIES - 1:
+                    LOGGER.warning(
+                        "Request failed, retrying",
+                        attempt=attempt + 1,
+                        max_retries=MAX_RETRIES,
+                        error=str(e),
+                    )
+                    time.sleep(RETRY_DELAY)
+                else:
+                    LOGGER.error("Request failed after all retries", error=str(e))
+                    raise
 
-        return response
+        # Should never reach here, but just in case
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Request failed for unknown reason")
 
     def login(self, email: str, password: str) -> Dict[str, Any]:
         """
@@ -995,4 +1041,511 @@ class NottorneyClient:
         result = [NotesAction.from_dict(action) for action in data]
         LOGGER.info("Fetched pending notes actions", deck_id=deck_id_str, count=len(result))
         return result
+
+    # ==================== SUGGESTION SYSTEM ====================
+
+    def create_change_note_suggestion(
+        self,
+        change_note_suggestion: ChangeNoteSuggestion,
+        auto_accept: bool = False,
+    ) -> None:
+        """
+        Create a suggestion to change an existing note.
+
+        Args:
+            change_note_suggestion: The suggestion data
+            auto_accept: Whether to auto-accept the suggestion (if user has permission)
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Creating change note suggestion", note_id=str(change_note_suggestion.ah_nid))
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            f"/notes/{change_note_suggestion.ah_nid}/suggestion/",
+            json={**change_note_suggestion.to_dict(), "auto_accept": auto_accept},
+        )
+
+        if response.status_code != 201:
+            raise NottorneyHTTPError(response)
+
+        LOGGER.info("Created change note suggestion", note_id=str(change_note_suggestion.ah_nid))
+
+    def create_new_note_suggestion(
+        self,
+        new_note_suggestion: NewNoteSuggestion,
+        auto_accept: bool = False,
+    ) -> None:
+        """
+        Create a suggestion to add a new note.
+
+        Args:
+            new_note_suggestion: The suggestion data
+            auto_accept: Whether to auto-accept the suggestion (if user has permission)
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Creating new note suggestion", deck_id=str(new_note_suggestion.ah_did))
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            f"/decks/{new_note_suggestion.ah_did}/note-suggestion/",
+            json={**new_note_suggestion.to_dict(), "auto_accept": auto_accept},
+        )
+
+        if response.status_code != 201:
+            raise NottorneyHTTPError(response)
+
+        LOGGER.info("Created new note suggestion", deck_id=str(new_note_suggestion.ah_did))
+
+    def create_suggestions_in_bulk(
+        self,
+        new_note_suggestions: List[NewNoteSuggestion] = None,
+        change_note_suggestions: List[ChangeNoteSuggestion] = None,
+        auto_accept: bool = False,
+    ) -> Dict[int, Dict[str, List[str]]]:
+        """
+        Create multiple suggestions in bulk.
+
+        Args:
+            new_note_suggestions: List of new note suggestions
+            change_note_suggestions: List of change note suggestions
+            auto_accept: Whether to auto-accept suggestions (if user has permission)
+
+        Returns:
+            Dict mapping anki_nid to validation errors (if any)
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        if new_note_suggestions is None:
+            new_note_suggestions = []
+        if change_note_suggestions is None:
+            change_note_suggestions = []
+
+        errors_for_change_suggestions = self._create_suggestion_in_bulk_inner(
+            suggestions=change_note_suggestions,
+            url="/notes/bulk-change-suggestions/",
+            auto_accept=auto_accept,
+        )
+
+        errors_for_new_note_suggestions = self._create_suggestion_in_bulk_inner(
+            suggestions=new_note_suggestions,
+            url="/notes/bulk-new-note-suggestions/",
+            auto_accept=auto_accept,
+        )
+
+        return {
+            **errors_for_change_suggestions,
+            **errors_for_new_note_suggestions,
+        }
+
+    def _create_suggestion_in_bulk_inner(
+        self, suggestions: List[NoteSuggestion], url: str, auto_accept: bool
+    ) -> Dict[int, Dict[str, List[str]]]:
+        """Internal method to create suggestions in bulk."""
+        if not suggestions:
+            return {}
+
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            url,
+            json={
+                "suggestions": [s.to_dict() for s in suggestions],
+                "auto_accept": auto_accept,
+            },
+            is_long_running=True,
+        )
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        data = response.json()
+        errors_by_anki_nid = {
+            suggestion.anki_nid: d["validation_errors"]
+            for d, suggestion in zip(data, suggestions)
+            if d.get("validation_errors")
+        }
+        return errors_by_anki_nid
+
+    # ==================== REVIEW DATA TRACKING ====================
+
+    def send_card_review_data(self, card_review_data: List[CardReviewData]) -> None:
+        """
+        Send card review statistics to the backend.
+
+        Args:
+            card_review_data: List of review data per deck
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Sending card review data", count=len(card_review_data))
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            "/users/card-review-data/",
+            json=[review.to_dict() for review in card_review_data],
+            is_long_running=True,
+        )
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        LOGGER.info("Sent card review data successfully")
+
+    def send_daily_card_review_summaries(self, daily_card_review_summaries: List[DailyCardReviewSummary]) -> None:
+        """
+        Send daily card review summaries to the backend.
+
+        Args:
+            daily_card_review_summaries: List of daily review summaries
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Sending daily card review summaries", count=len(daily_card_review_summaries))
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            "/users/daily-card-review-summary/",
+            json=[summary.to_dict() for summary in daily_card_review_summaries],
+            is_long_running=True,
+        )
+
+        if response.status_code != 201:
+            raise NottorneyHTTPError(response)
+
+        LOGGER.info("Sent daily card review summaries successfully")
+
+    # ==================== DECK UPLOAD ====================
+
+    def upload_deck(
+        self,
+        deck_name: str,
+        notes_data: List[NoteInfo],
+        note_types_data: List[Dict[str, Any]],
+        anki_deck_id: int,
+        private: bool = False,
+    ) -> uuid.UUID:
+        """
+        Upload a new deck to Nottorney.
+
+        Args:
+            deck_name: Name of the deck
+            notes_data: List of notes in the deck
+            note_types_data: List of note type definitions
+            anki_deck_id: Anki deck ID
+            private: Whether the deck is private
+
+        Returns:
+            UUID of the created deck
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        import re
+        deck_name_normalized = re.sub(r'[\\/?<>:*|"^]', "_", deck_name)
+        deck_file_name = f"{deck_name_normalized}-{uuid.uuid4()}.json.gz"
+
+        # Get presigned URL for upload
+        presigned_url = self.generate_presigned_url(key=deck_file_name, action="upload", many=False)
+        presigned_url_suffix = presigned_url.split(self.s3_bucket_url)[1] if self.s3_bucket_url else presigned_url
+
+        # Prepare notes data
+        from .ankihub_client.models import note_info_for_upload
+        notes_data_transformed = [note_info_for_upload(note_data).to_dict() for note_data in notes_data]
+
+        # Compress data
+        import gzip
+        data = gzip.compress(
+            json.dumps(
+                {
+                    "notes": notes_data_transformed,
+                    "note_types": note_types_data,
+                }
+            ).encode("utf-8")
+        )
+
+        # Upload to storage
+        LOGGER.info("Uploading deck to storage", deck_name=deck_name, file_name=deck_file_name)
+        s3_response = self._send_request(
+            "PUT",
+            API.S3,
+            presigned_url_suffix,
+            data=data,
+            is_long_running=True,
+        )
+
+        if s3_response.status_code != 200:
+            raise NottorneyHTTPError(s3_response)
+
+        # Create deck record
+        LOGGER.info("Creating deck record", deck_name=deck_name)
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            "/decks/",
+            json={
+                "key": deck_file_name,
+                "name": deck_name,
+                "anki_id": anki_deck_id,
+                "is_private": private,
+            },
+        )
+
+        if response.status_code != 201:
+            raise NottorneyHTTPError(response)
+
+        response_data = response.json()
+        deck_id = uuid.UUID(response_data["deck_id"])
+        LOGGER.info("Deck uploaded successfully", deck_id=str(deck_id), deck_name=deck_name)
+        return deck_id
+
+    def upload_media(self, media_paths: Set[Path], deck_id: Union[str, uuid.UUID]) -> None:
+        """
+        Upload media files for a deck.
+
+        Args:
+            media_paths: Set of paths to media files
+            deck_id: UUID of the deck
+
+        Raises:
+            NottorneyHTTPError: If upload fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        if not self.local_media_dir_path_cb:
+            raise ValueError("local_media_dir_path_cb not configured")
+
+        deck_id_str = str(deck_id)
+        LOGGER.info("Uploading media files", deck_id=deck_id_str, count=len(media_paths))
+
+        # Get presigned URL for multiple uploads
+        prefix = f"deck_assets/{deck_id_str}"
+        presigned_info = self._get_presigned_url_for_multiple_uploads(prefix)
+
+        # Upload each file
+        for media_path in media_paths:
+            if not media_path.is_file():
+                LOGGER.warning("Media file not found, skipping", path=str(media_path))
+                continue
+
+            # Upload file
+            with open(media_path, "rb") as f:
+                url_suffix = presigned_info["url"].split(self.s3_bucket_url)[1] if self.s3_bucket_url else presigned_info["url"]
+                response = self._send_request(
+                    "POST",
+                    API.S3,
+                    url_suffix,
+                    data=presigned_info["fields"],
+                    files={"file": (media_path.name, f)},
+                    is_long_running=True,
+                )
+
+                if response.status_code != 204:
+                    raise NottorneyHTTPError(response)
+
+        LOGGER.info("Media files uploaded successfully", deck_id=deck_id_str, count=len(media_paths))
+
+    def _get_presigned_url_for_multiple_uploads(self, prefix: str) -> Dict[str, Any]:
+        """Get presigned URL for uploading multiple files."""
+        response = self._send_request(
+            "GET",
+            API.NOTTORNEY,
+            "/decks/generate-presigned-url",
+            params={"key": prefix, "type": "upload", "many": "true"},
+        )
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        return response.json()["pre_signed_url"]
+
+    # ==================== FEATURE FLAGS ====================
+
+    def get_feature_flags(self) -> Dict[str, bool]:
+        """
+        Get feature flags from the backend.
+
+        Returns:
+            Dict mapping feature flag names to enabled status
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Fetching feature flags")
+        response = self._send_request("GET", API.NOTTORNEY, "/feature-flags/")
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        data = response.json()
+        result = {flag_name: flag_data["is_active"] for flag_name, flag_data in data.get("flags", {}).items()}
+        LOGGER.info("Fetched feature flags", count=len(result))
+        return result
+
+    # ==================== USER DETAILS ====================
+
+    def get_user_details(self) -> Dict[str, Any]:
+        """
+        Get current user details.
+
+        Returns:
+            Dict with user information
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        LOGGER.info("Fetching user details")
+        response = self._send_request("GET", API.NOTTORNEY, "/users/me")
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        data = response.json()
+        LOGGER.info("Fetched user details", user_id=data.get("id"))
+        return data
+
+    def owned_deck_ids(self) -> List[uuid.UUID]:
+        """
+        Get list of deck IDs owned by the current user.
+
+        Returns:
+            List of deck UUIDs
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        data = self.get_user_details()
+        result = [uuid.UUID(deck["id"]) for deck in data.get("created_decks", [])]
+        return result
+
+    # ==================== NOTE TYPE MANAGEMENT ====================
+
+    def create_note_type(self, deck_id: Union[str, uuid.UUID], note_type: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a new note type for a deck.
+
+        Args:
+            deck_id: UUID of the deck
+            note_type: Note type definition (Anki format)
+
+        Returns:
+            Created note type (Anki format)
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        deck_id_str = str(deck_id)
+        # Transform to Nottorney format
+        note_type_transformed = self._to_nottorney_note_type(note_type.copy())
+
+        LOGGER.info("Creating note type", deck_id=deck_id_str, note_type_name=note_type.get("name"))
+        response = self._send_request(
+            "POST",
+            API.NOTTORNEY,
+            f"/decks/{deck_id_str}/create-note-type/",
+            json=note_type_transformed,
+        )
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        data = response.json()
+        result = self._to_anki_note_type(data)
+        LOGGER.info("Created note type", deck_id=deck_id_str, note_type_id=result.get("id"))
+        return result
+
+    def update_note_type(
+        self,
+        deck_id: Union[str, uuid.UUID],
+        note_type: Dict[str, Any],
+        keys_to_update: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Update an existing note type.
+
+        Args:
+            deck_id: UUID of the deck
+            note_type: Note type definition (Anki format)
+            keys_to_update: List of keys to update
+
+        Returns:
+            Updated note type (Anki format)
+
+        Raises:
+            NottorneyHTTPError: If request fails
+        """
+        if not self.token:
+            raise ValueError("Not authenticated. Call login() first.")
+
+        deck_id_str = str(deck_id)
+        note_type_id = note_type["id"]
+        note_type_filtered = {key: note_type[key] for key in keys_to_update}
+        note_type_transformed = self._to_nottorney_note_type(note_type_filtered.copy())
+
+        LOGGER.info("Updating note type", deck_id=deck_id_str, note_type_id=note_type_id)
+        response = self._send_request(
+            "PATCH",
+            API.NOTTORNEY,
+            f"/decks/{deck_id_str}/note-types/{note_type_id}/",
+            json=note_type_transformed,
+        )
+
+        if response.status_code != 200:
+            raise NottorneyHTTPError(response)
+
+        data = response.json()
+        result = self._to_anki_note_type(data)
+        LOGGER.info("Updated note type", deck_id=deck_id_str, note_type_id=note_type_id)
+        return result
+
+    def _to_anki_note_type(self, note_type_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform Nottorney note type format to Anki format."""
+        note_type_data["id"] = note_type_data.pop("anki_id", note_type_data.get("id"))
+        note_type_data["tmpls"] = note_type_data.pop("templates", note_type_data.get("tmpls", []))
+        note_type_data["flds"] = note_type_data.pop("fields", note_type_data.get("flds", []))
+        return note_type_data
+
+    def _to_nottorney_note_type(self, note_type: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform Anki note type format to Nottorney format."""
+        if "id" in note_type:
+            note_type["anki_id"] = note_type.pop("id")
+        if "tmpls" in note_type:
+            note_type["templates"] = note_type.pop("tmpls")
+        if "flds" in note_type:
+            note_type["fields"] = note_type.pop("flds")
+        return note_type
 

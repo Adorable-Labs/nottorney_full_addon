@@ -5,11 +5,13 @@ Complete guide for implementing the Nottorney backend in Lovable with Supabase E
 ## 📋 Table of Contents
 
 1. [Prerequisites](#prerequisites)
-2. [Database Setup](#database-setup)
-3. [Storage Setup](#storage-setup)
-4. [Edge Functions Setup](#edge-functions-setup)
-5. [Testing](#testing)
-6. [Deployment](#deployment)
+2. [Architecture Overview](#architecture-overview)
+3. [Database Setup](#database-setup)
+4. [Storage Setup](#storage-setup)
+5. [Edge Functions Setup](#edge-functions-setup)
+6. [Payment Integration](#payment-integration)
+7. [Testing](#testing)
+8. [Deployment](#deployment)
 
 ---
 
@@ -31,6 +33,26 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key (for admin operations)
 ```
+
+---
+
+## Architecture Overview
+
+### Payment Flow
+
+**IMPORTANT**: Payment processing happens entirely on the **Nottorney web app**, NOT in the Anki addon.
+
+- **Web App**: Handles PayPal, GCash, HitPay payments
+- **Addon**: Only authenticates and checks purchase status
+
+See `PAYMENT_FLOW.md` for detailed architecture.
+
+### Addon Endpoints (Simple)
+
+The addon only needs 3 endpoints:
+1. `POST /addon-auth/login` - Authenticate user
+2. `GET /addon-auth/decks` - List purchased decks (only completed purchases)
+3. `POST /addon-auth/download` - Get download URL for purchased deck
 
 ---
 
@@ -58,12 +80,14 @@ VALUES (
 );
 
 -- Create a test user (via Supabase Auth UI or API)
--- Then create a test purchase
-INSERT INTO purchases (user_id, product_id, amount)
+-- Then create a test purchase (simulating web app payment completion)
+INSERT INTO purchases (user_id, product_id, amount, payment_status, payment_method)
 VALUES (
   'user-uuid-here',
   (SELECT id FROM products WHERE title = 'Test Medical Deck'),
-  29.99
+  29.99,
+  'completed', -- Payment already completed on web app
+  'paypal'
 );
 ```
 
@@ -96,6 +120,8 @@ In Lovable, create these Edge Functions:
 
 **Path**: `backend/edge-functions/addon-auth/login.ts`
 
+**Purpose**: Authenticate user and return access token with purchased decks
+
 **Deploy Command** (if using Supabase CLI):
 ```bash
 supabase functions deploy addon-auth/login
@@ -112,6 +138,8 @@ curl -X POST https://your-project.supabase.co/functions/v1/addon-auth/login \
 
 **Path**: `backend/edge-functions/addon-auth/decks.ts`
 
+**Purpose**: List user's purchased decks (only completed purchases)
+
 **Deploy Command**:
 ```bash
 supabase functions deploy addon-auth/decks
@@ -126,6 +154,8 @@ curl -X GET https://your-project.supabase.co/functions/v1/addon-auth/decks \
 #### Function 3: `addon-auth/download`
 
 **Path**: `backend/edge-functions/addon-auth/download.ts`
+
+**Purpose**: Generate signed download URL for purchased deck
 
 **Deploy Command**:
 ```bash
@@ -153,6 +183,59 @@ const corsHeaders = {
 
 ---
 
+## Payment Integration
+
+### Web App Payment Endpoints (Not in Addon)
+
+The web app needs these endpoints (separate from addon-auth):
+
+1. **Create Payment Intent**
+   - `POST /api/payments/create` - Initialize PayPal/HitPay checkout
+   - `POST /api/payments/gcash/initiate` - Start GCash manual payment
+
+2. **Payment Webhooks**
+   - `POST /api/webhooks/paypal` - Handle PayPal payment completion
+   - `POST /api/webhooks/hitpay` - Handle HitPay payment completion
+
+3. **GCash Manual Confirmation**
+   - `POST /api/payments/gcash/submit` - User submits payment proof
+   - `GET /api/admin/payments/pending` - Admin views pending GCash payments
+   - `POST /api/admin/payments/approve` - Admin approves GCash payment
+
+### Payment Flow Example (GCash)
+
+```typescript
+// 1. User initiates payment on web app
+POST /api/payments/gcash/initiate
+{
+  "product_id": "deck-uuid",
+  "amount": 29.99
+}
+// Returns: { purchase_id, reference_number, gcash_account_details }
+
+// 2. User sends payment and submits proof
+POST /api/payments/gcash/submit
+{
+  "purchase_id": "purchase-uuid",
+  "reference_number": "GC123456",
+  "screenshot_url": "https://..."
+}
+// Creates payment_confirmations record with status='pending'
+
+// 3. Admin approves payment (web app dashboard)
+POST /api/admin/payments/approve
+{
+  "confirmation_id": "confirmation-uuid"
+}
+// Updates purchases.payment_status = 'completed'
+
+// 4. Addon can now see the purchase
+GET /addon-auth/decks
+// Returns the newly purchased deck
+```
+
+---
+
 ## Testing
 
 ### 1. Test Authentication Flow
@@ -165,7 +248,7 @@ RESPONSE=$(curl -X POST https://your-project.supabase.co/functions/v1/addon-auth
 
 TOKEN=$(echo $RESPONSE | jq -r '.access_token')
 
-# 2. Get decks
+# 2. Get decks (only shows completed purchases)
 curl -X GET https://your-project.supabase.co/functions/v1/addon-auth/decks \
   -H "Authorization: Bearer $TOKEN"
 
@@ -185,7 +268,7 @@ curl -X POST https://your-project.supabase.co/functions/v1/addon-auth/download \
 
 2. Open Anki → Tools → Nottorney → Login
 3. Enter test credentials
-4. Verify purchased decks appear
+4. Verify purchased decks appear (only completed purchases)
 5. Test deck download
 
 ---
@@ -200,15 +283,18 @@ curl -X POST https://your-project.supabase.co/functions/v1/addon-auth/download \
 - [ ] Edge Functions deployed
 - [ ] Environment variables set
 - [ ] CORS configured for production domain
+- [ ] Web app payment endpoints implemented (separate from addon)
 
 ### Post-Deployment
 
 - [ ] Test login endpoint
-- [ ] Test decks endpoint
+- [ ] Test decks endpoint (only shows completed purchases)
 - [ ] Test download endpoint
 - [ ] Verify signed URLs expire correctly
 - [ ] Test with actual addon
 - [ ] Monitor error logs
+- [ ] Test payment flow on web app
+- [ ] Verify purchases appear in addon after payment completion
 
 ---
 
@@ -235,6 +321,49 @@ See `NOTTORNEY_VERIFICATION.md` for full endpoint specifications.
 
 ---
 
+## ✅ Implemented Features
+
+### Core Features (Phase 1)
+- ✅ Authentication (login, decks, download)
+- ✅ Suggestion system (all endpoints)
+- ✅ Review data tracking (all endpoints)
+- ✅ Feature flags
+- ✅ User details
+
+### Edge Functions Created
+- ✅ `backend/edge-functions/addon-auth/login.ts`
+- ✅ `backend/edge-functions/addon-auth/decks.ts`
+- ✅ `backend/edge-functions/addon-auth/download.ts`
+- ✅ `backend/edge-functions/addon-auth/suggestions.ts`
+- ✅ `backend/edge-functions/addon-auth/review-data.ts`
+- ✅ `backend/edge-functions/addon-auth/feature-flags.ts`
+- ✅ `backend/edge-functions/addon-auth/user-details.ts`
+
+### Database Tables Created
+- ✅ All core tables (products, purchases, profiles)
+- ✅ All sync tables (notes, note_types, deck_media, etc.)
+- ✅ Suggestion tables (change_note_suggestions, new_note_suggestions)
+- ✅ Review data tables (card_review_data, daily_card_review_summaries)
+- ✅ Feature flags tables (feature_flags, user_feature_flags)
+
+### Addon Client Methods
+- ✅ All Phase 1 sync methods
+- ✅ All suggestion methods
+- ✅ All review data methods
+- ✅ Deck upload methods
+- ✅ Feature flags method
+- ✅ User details method
+
+### Still Needs Implementation
+- ⚠️ Sync endpoints (updates, media, note-types, protected fields/tags)
+- ⚠️ Deck upload endpoints
+- ⚠️ Deck subscription management
+- ⚠️ Deck extensions
+
+See `COMPLETE_API_REFERENCE.md` for full API documentation.
+
+---
+
 ## Troubleshooting
 
 ### Issue: "Invalid credentials" on login
@@ -248,6 +377,7 @@ See `NOTTORNEY_VERIFICATION.md` for full endpoint specifications.
 
 **Solution**:
 - Check `purchases` table has entry for user + product
+- Verify `payment_status = 'completed'` (not 'pending')
 - Verify RLS policies allow user to see their purchases
 
 ### Issue: Signed URL generation fails
@@ -263,6 +393,13 @@ See `NOTTORNEY_VERIFICATION.md` for full endpoint specifications.
 - Check CORS headers in Edge Functions
 - Verify `Access-Control-Allow-Origin` includes your domain
 - Test with browser DevTools Network tab
+
+### Issue: Purchased deck not showing in addon
+
+**Solution**:
+- Verify `payment_status = 'completed'` in purchases table
+- Check RLS policies allow user to see their purchases
+- Verify user_id matches the logged-in user
 
 ---
 
@@ -283,4 +420,4 @@ For issues or questions:
 4. **Validate all inputs** (product_id format, etc.)
 5. **Rate limit** API endpoints to prevent abuse
 6. **Log security events** (failed logins, unauthorized access attempts)
-
+7. **Payment processing is separate** - addon never handles payments

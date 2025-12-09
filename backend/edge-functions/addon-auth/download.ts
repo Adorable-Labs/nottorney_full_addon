@@ -75,12 +75,14 @@ serve(async (req) => {
       )
     }
 
-    // Check if user has purchased this deck
+    // Check if user has purchased this deck (payment must be completed)
+    // Payment confirmation happens on web app, not in addon
     const { data: purchase, error: purchaseError } = await supabase
       .from('purchases')
       .select('product_id')
       .eq('user_id', user.id)
       .eq('product_id', product_id)
+      .eq('payment_status', 'completed') // Only allow download if payment completed
       .single()
 
     if (purchaseError || !purchase) {

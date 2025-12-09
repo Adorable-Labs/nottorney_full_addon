@@ -17,6 +17,12 @@ ALTER TABLE protected_tags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deck_extensions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE note_customizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notes_actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE change_note_suggestions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE new_note_suggestions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE card_review_data ENABLE ROW LEVEL SECURITY;
+ALTER TABLE daily_card_review_summaries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE feature_flags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_feature_flags ENABLE ROW LEVEL SECURITY;
 
 -- ============================================================================
 -- HELPER FUNCTION: Get current user ID
@@ -121,14 +127,14 @@ CREATE POLICY "Users can view notes for purchased/subscribed decks"
 -- NOTE TYPES POLICIES
 -- ============================================================================
 
--- Same as notes - only for purchased/subscribed decks
-CREATE POLICY "Users can view note types for purchased/subscribed decks"
+-- Same as notes - only for purchased decks
+CREATE POLICY "Users can view note types for purchased decks"
   ON note_types FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
 
@@ -136,14 +142,14 @@ CREATE POLICY "Users can view note types for purchased/subscribed decks"
 -- DECK MEDIA POLICIES
 -- ============================================================================
 
--- Users can view media for purchased/subscribed decks
-CREATE POLICY "Users can view media for purchased/subscribed decks"
+-- Users can view media for purchased decks
+CREATE POLICY "Users can view media for purchased decks"
   ON deck_media FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
 
@@ -151,24 +157,24 @@ CREATE POLICY "Users can view media for purchased/subscribed decks"
 -- PROTECTED FIELDS/TAGS POLICIES
 -- ============================================================================
 
--- Users can view protected fields/tags for purchased/subscribed decks
-CREATE POLICY "Users can view protected fields for purchased/subscribed decks"
+-- Users can view protected fields/tags for purchased decks
+CREATE POLICY "Users can view protected fields for purchased decks"
   ON protected_fields FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
 
-CREATE POLICY "Users can view protected tags for purchased/subscribed decks"
+CREATE POLICY "Users can view protected tags for purchased decks"
   ON protected_tags FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
 
@@ -176,14 +182,14 @@ CREATE POLICY "Users can view protected tags for purchased/subscribed decks"
 -- DECK EXTENSIONS POLICIES
 -- ============================================================================
 
--- Users can view extensions for decks they have access to
-CREATE POLICY "Users can view extensions for accessible decks"
+-- Users can view extensions for decks they have purchased
+CREATE POLICY "Users can view extensions for purchased decks"
   ON deck_extensions FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
 
@@ -208,9 +214,9 @@ CREATE POLICY "Users can view customizations for accessible extensions"
     deck_extension_id IN (
       SELECT id FROM deck_extensions
       WHERE product_id IN (
-        SELECT product_id FROM purchases WHERE user_id = auth.uid()
-        UNION
-        SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+        SELECT product_id FROM purchases 
+        WHERE user_id = auth.uid() 
+        AND payment_status = 'completed'
       )
     )
   );
@@ -219,14 +225,101 @@ CREATE POLICY "Users can view customizations for accessible extensions"
 -- NOTES ACTIONS POLICIES
 -- ============================================================================
 
--- Users can view actions for purchased/subscribed decks
-CREATE POLICY "Users can view actions for purchased/subscribed decks"
+-- Users can view actions for purchased decks
+CREATE POLICY "Users can view actions for purchased decks"
   ON notes_actions FOR SELECT
   USING (
     product_id IN (
-      SELECT product_id FROM purchases WHERE user_id = auth.uid()
-      UNION
-      SELECT product_id FROM deck_subscriptions WHERE user_id = auth.uid()
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
     )
   );
+
+-- ============================================================================
+-- SUGGESTIONS POLICIES
+-- ============================================================================
+
+-- Users can view their own suggestions
+CREATE POLICY "Users can view their own suggestions"
+  ON change_note_suggestions FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users can create suggestions for decks they have purchased
+CREATE POLICY "Users can create change note suggestions"
+  ON change_note_suggestions FOR INSERT
+  WITH CHECK (
+    auth.uid() = user_id AND
+    note_id IN (
+      SELECT id FROM notes
+      WHERE product_id IN (
+        SELECT product_id FROM purchases 
+        WHERE user_id = auth.uid() 
+        AND payment_status = 'completed'
+      )
+    )
+  );
+
+-- Users can view their own new note suggestions
+CREATE POLICY "Users can view their own new note suggestions"
+  ON new_note_suggestions FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users can create new note suggestions for decks they have purchased
+CREATE POLICY "Users can create new note suggestions"
+  ON new_note_suggestions FOR INSERT
+  WITH CHECK (
+    auth.uid() = user_id AND
+    product_id IN (
+      SELECT product_id FROM purchases 
+      WHERE user_id = auth.uid() 
+      AND payment_status = 'completed'
+    )
+  );
+
+-- ============================================================================
+-- REVIEW DATA POLICIES
+-- ============================================================================
+
+-- Users can only view their own review data
+CREATE POLICY "Users can view their own review data"
+  ON card_review_data FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users can insert/update their own review data
+CREATE POLICY "Users can manage their own review data"
+  ON card_review_data FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- Users can only view their own daily summaries
+CREATE POLICY "Users can view their own daily summaries"
+  ON daily_card_review_summaries FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users can insert/update their own daily summaries
+CREATE POLICY "Users can manage their own daily summaries"
+  ON daily_card_review_summaries FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- ============================================================================
+-- FEATURE FLAGS POLICIES
+-- ============================================================================
+
+-- All authenticated users can view feature flags
+CREATE POLICY "Authenticated users can view feature flags"
+  ON feature_flags FOR SELECT
+  USING (auth.uid() IS NOT NULL);
+
+-- Users can view their own feature flag overrides
+CREATE POLICY "Users can view their own feature flag overrides"
+  ON user_feature_flags FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users can manage their own feature flag overrides
+CREATE POLICY "Users can manage their own feature flag overrides"
+  ON user_feature_flags FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
